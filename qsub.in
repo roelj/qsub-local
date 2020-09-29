@@ -1,0 +1,313 @@
+#!@GUILE@ --no-auto-compile
+-*- scheme -*-
+!#
+;;; Copyright © 2020  Roel Janssen <roel@gnu.org>
+
+;;; This program is free software: you can redistribute it and/or
+;;; modify it under the terms of the GNU General Public License as
+;;; published by the Free Software Foundation, either version 3 of
+;;; the License, or (at your option) any later version.
+
+(use-modules (ice-9 format)
+             (ice-9 popen)
+             (ice-9 rdelim)
+             (ice-9 textual-ports)
+             (srfi srfi-1))
+
+(define (flatten lst)
+  (cond [(null? lst)
+         '()]
+        [(pair? lst)
+         (append (flatten (car lst)) (flatten (cdr lst)))]
+        [else (list lst)]))
+
+(define (assoc-ref-all lst key)
+  (delete #f (map (lambda (pair)
+                    (let ((comp (if (string? key) string= eq?)))
+                      (if (comp (car pair) key)
+                          (cdr pair)
+                          #f)))
+                  lst)))
+
+;;
+;; Program options
+;; ----------------------------------------------------------------------------
+
+(define* (parse-options options #:optional (config '()))
+  (if (null? options)
+      config
+      (let ((option   (car options))
+            (argument (if (> (length options) 1)
+                          (cadr options)
+                          "")))
+        (cond
+         ((string= "-l" option)
+          (if (string-contains argument ",")
+              (let ((rt-specs (string-split argument #\,)))
+                (parse-options
+                 (flatten
+                  (append (map (lambda (arg) (list "-l" arg)) rt-specs)
+                          (cddr options)))
+                 config))
+              (cond
+               ;; Runtime property
+               ;; -------------------------------------------------------------
+               ((string-prefix? "h_rt=" argument)
+                (parse-options (cddr options)
+                               (cons `(time . ,(substring argument 5))
+                                     config)))
+               ;; Memory property
+               ;; -------------------------------------------------------------
+               ((string-prefix? "h_vmem=" argument)
+                (parse-options (cddr options)
+                               (cons `(memory . ,(substring argument 7))
+                                     config))))))
+
+         ;; Threads
+         ;; -------------------------------------------------------------------
+         ((and (string= "-pe" option)
+               (string= "threaded" argument)
+               (> (length options) 2))
+          (parse-options (cdddr options)
+                         (cons `(threads . ,(caddr options))
+                               config)))
+
+         ;; Preserve environment option.
+         ;; -------------------------------------------------------------------
+         ((string= "-V" option)
+          (parse-options (cdr options)
+                         (cons `(preserve-environment . #t) config)))
+
+         ((string= "-cwd" option)
+          (parse-options (cdr options)
+                         (cons `(preserve-cwd . #t) config)))
+
+         ;; Job name.
+         ;; -------------------------------------------------------------------
+         ((string= "-N" option)
+          (parse-options (cddr options)
+                         (cons `(name . ,argument) config)))
+
+         ;; E-mail options
+         ;; -------------------------------------------------------------------
+         ((string= "-m" option)
+          (parse-options (cddr options)
+                         (cons `(mail-events . ,argument) config)))
+
+         ((string= "-M" option)
+          (parse-options (cddr options)
+                         (cons `(mail-address . ,argument) config)))
+
+         ;; Logging options
+         ;; -------------------------------------------------------------------
+         ((string= "-e" option)
+          (parse-options (cddr options)
+                         (cons `(error-stream . ,argument) config)))
+
+         ((string= "-o" option)
+          (parse-options (cddr options)
+                         (cons `(output-stream . ,argument) config)))
+
+         ;; Array jobs
+         ;; -------------------------------------------------------------------
+         ((string= "-t" option)
+          (catch #t
+            (lambda _
+              (let* ((dash   (string-index argument #\-))
+                     (colon  (string-index argument #\:))
+                     (start  (substring argument 0 dash))
+                     (end    (if colon
+                                 (substring argument (+ dash 1) colon)
+                                 (substring argument (+ dash 1))))
+                     (step   (if colon
+                                 (substring argument (+ colon 1))
+                                 "1"))
+                     (range  (map string->number (list start end step))))
+                (parse-options (cddr options)
+                               (cons `(array-jobs . ,range) config))))
+            (lambda (key . args)
+              (format #t
+               "For array jobs, the format should be 'n-m' or 'n-m:o'."))))
+
+         ;; Administrative options
+         ;; -------------------------------------------------------------------
+         ((string= "-P" option)
+          (format #t "Ignoring option ~s.~%" "-P")
+          (parse-options (cddr options)
+                         (cons `(project . ,argument) config)))
+
+         ((string= "-q" option)
+          (format #t "Ignoring option '~s.~%" "-q")
+          (parse-options (cddr options)
+                         (cons `(queue . ,argument) config)))
+
+         ((string= "-R" option)
+          (format #t "Ignoring option ~s.~%" "-R")
+          (parse-options (cddr options)
+                         (cons `(reservation . ,argument) config)))
+
+         ;; Additional options
+         ((string= "-@" option)
+          (let* ((additional-options (call-with-input-file argument read-line))
+                 (split-opts (string-split additional-options #\space)))
+            (parse-options (append split-opts (cddr options))
+                           (cons `(configfile . ,argument) config))))
+
+         ;; Job dependencies
+         ;; -------------------------------------------------------------------
+         ((string= "-hold_jid" option)
+          (let ((jids (string-split argument #\,)))
+            (parse-options (cddr options)
+              (append (map (lambda (jid)
+                             `(dependency . ,jid))
+                           jids)
+                      config))))
+
+         ;; Unhandled options
+         ;; -------------------------------------------------------------------
+         ((string-prefix? "-" option)
+          (format (current-error-port)
+                  "Ignoring unhandled option ~s and skipping one argument.~%"
+                  option)
+          (parse-options (cddr options) config))
+
+         (else
+          (parse-options (cdr options)
+                         (cons `(script . ,option) config)))))))
+
+(define %config (parse-options (cdr (command-line))))
+(define %username (getlogin))
+
+(unless (string? %username)
+  (set! %username (getenv "LOGNAME"))
+  (unless (string? %username)
+    (format #t "Could not obtain your username.~%")
+    (exit 0)))
+
+;;
+;; Fixing some non-trivial incompatibility.
+;; ----------------------------------------------------------------------------
+;;
+;; Specifying directories instead of files to log to is handled by SGE by
+;; making up a filename.  SLURM does not do such a thing, but seems to ignore
+;; the logging.  Here we attempt mitigate that incompatibility by making up
+;; a filename.
+
+(when (and (assoc-ref %config 'error-stream)
+           (assoc-ref %config 'script))
+  (let ((file (stat (assoc-ref %config 'error-stream) #f)))
+    (when (and file (eq? (stat:type file) 'directory))
+      (assoc-set! %config 'error-stream
+                  (string-append
+                   (assoc-ref %config 'error-stream)
+                   "/" (basename (assoc-ref %config 'script)) ".err")))))
+
+(when (and (assoc-ref %config 'output-stream)
+           (assoc-ref %config 'script))
+  (let ((file (stat (assoc-ref %config 'output-stream) #f)))
+    (when (and file (eq? (stat:type file) 'directory))
+      (assoc-set! %config 'output-stream
+                  (string-append
+                   (assoc-ref %config 'output-stream)
+                   "/" (basename (assoc-ref %config 'script)) ".out")))))
+
+
+;;
+;; Wrap command from stdin
+;; ----------------------------------------------------------------------------
+(define (read-job-script-from-stdin)
+  "Creates a job script from the data passed to stdin."
+  (let* ((job-port     (mkstemp! (string-copy "/tmp/qsub-slurm-XXXXXX")))
+         (job-filename (port-filename job-port)))
+    (format job-port "#!/bin/sh~%~a~%" (get-string-all (current-input-port)))
+    (close-port job-port)
+    job-filename))
+
+(unless (assoc-ref %config 'script)
+  (set! %config (cons `(stdin-script . ,(read-job-script-from-stdin)) %config)))
+
+;;
+;; Write a shell script and run it.
+;; ----------------------------------------------------------------------------
+(define (run-job script)
+  "Run the shell script that can be read from PORT."
+  (let* ((job-port     (mkstemp! "/tmp/qsub-local-XXXXXX"))
+         (job-filename (port-filename job-port)))
+    (format job-port "~a" script)
+    (chmod job-port #o500)
+    (close-port job-port)
+    (format #t "Executing: ~a~%" job-filename)
+    (let ((return-value (zero? (system job-filename))))
+      (delete-file job-filename)
+      return-value)))
+
+(define* (build-job-script output-stream error-stream preserve-cwd script
+                           #:optional (customizer #f))
+  (call-with-output-string
+    (lambda (port)
+      (format port "#!@BASH@~%")
+
+      ;; Output streams / log files
+      (when output-stream
+        (format port "export SGE_STDOUT_PATH=~s;~%" output-stream)
+        (format port "exec > ~s;~%" output-stream))
+
+      (when error-stream
+        (format port "export SGE_STDERR_PATH=~s;~%" error-stream)
+        (format port "exec 2> ~s;~%" error-stream))
+
+      (unless preserve-cwd
+        (format port "cd $HOME;~%"))
+
+      (when customizer
+        (customizer port))
+
+      (format port "@BASH@ ~s" script))))
+
+;;
+;; Command-line options processing
+;; ----------------------------------------------------------------------------
+(define (run-array-jobs command script preserve-environment
+                                    start end step)
+  (if (> start end)
+      #t
+      (begin
+        (run-job (primitive-eval
+                  (append command
+                          `(lambda port
+                             (format port "export SGE_TASK_ID=~a;~%export TASK_ID=~a~%"
+                                     start start)))))
+        (run-array-jobs
+         command script preserve-environment
+         (+ start step) end step))))
+
+(define (run-commands options)
+  (call-with-values (lambda _
+                      (partition (lambda (item)
+                                   (eq? (car item) 'dependency))
+                                 options))
+    (lambda (dependencies other)
+      (let* ((job-script (if (assoc-ref other 'script)
+                             (assoc-ref other 'script)
+                             (assoc-ref other 'stdin-script)))
+             (command `(build-job-script ,(assoc-ref other 'output-stream)
+                                         ,(assoc-ref other 'error-stream)
+                                         ,(assoc-ref other 'preserve-cwd)
+                                         ,job-script)))
+        (if (assoc-ref other 'array-jobs)
+            (let* ((range (assoc-ref other 'array-jobs))
+                   (start (list-ref range 0))
+                   (end   (list-ref range 1))
+                   (step  (list-ref range 2)))
+              (run-array-jobs command job-script start end step))
+            (let ((cmd (primitive-eval command)))
+              (run-job cmd)))))))
+
+;;
+;; Shellification
+;; ----------------------------------------------------------------------------
+
+(run-commands %config)
+
+(when (assoc-ref %config 'stdin-script)
+  (delete-file (assoc-ref %config 'stdin-script)))
