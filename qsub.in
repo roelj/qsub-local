@@ -229,14 +229,14 @@
 ;;
 ;; Write a shell script and run it.
 ;; ----------------------------------------------------------------------------
-(define (run-job script)
+(define (run-job script name)
   "Run the shell script that can be read from PORT."
-  (let* ((job-port     (mkstemp! "/tmp/qsub-local-XXXXXX"))
+  (let* ((job-port     (mkstemp! (string-copy "/tmp/qsub-local-XXXXXX")))
          (job-filename (port-filename job-port)))
     (format job-port "~a" script)
     (chmod job-port #o500)
     (close-port job-port)
-    (format #t "Executing: ~a~%" job-filename)
+    (format #t "Executing: ~a -> ~a~%" job-filename name)
     (let ((return-value (zero? (system job-filename))))
       (delete-file job-filename)
       return-value)))
@@ -273,10 +273,12 @@
       #t
       (begin
         (run-job (primitive-eval
-                  (append command
-                          `(lambda port
-                             (format port "export SGE_TASK_ID=~a;~%export TASK_ID=~a~%"
-                                     start start)))))
+                  (flatten
+                   (cons command
+                         (lambda (port)
+                           (format port "export SGE_TASK_ID=~a;~%export TASK_ID=~a~%"
+                                   start start)))))
+                 script)
         (run-array-jobs
          command script preserve-environment
          (+ start step) end step))))
@@ -299,9 +301,14 @@
                    (start (list-ref range 0))
                    (end   (list-ref range 1))
                    (step  (list-ref range 2)))
-              (run-array-jobs command job-script start end step))
+              (run-array-jobs command
+                              job-script
+                              (assoc-ref other 'preserve-environment)
+                              start
+                              end
+                              step))
             (let ((cmd (primitive-eval command)))
-              (run-job cmd)))))))
+              (run-job cmd job-script)))))))
 
 ;;
 ;; Shellification
