@@ -176,13 +176,6 @@
                          (cons `(script . ,option) config)))))))
 
 (define %config (parse-options (cdr (command-line))))
-(define %username (getlogin))
-
-(unless (string? %username)
-  (set! %username (getenv "LOGNAME"))
-  (unless (string? %username)
-    (format #t "Could not obtain your username.~%")
-    (exit 0)))
 
 ;;
 ;; Fixing some non-trivial incompatibility.
